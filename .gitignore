@@ -1,0 +1,60 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Logs and data
+logs/
+*.log
+store/
+*.dat
+*.bin
+
+# Config with secrets
+config/*_prod.json
+config/*_secret.json
+*.key
+*.pem
+
+# Model checkpoints
+models/checkpoints/
+*.pkl
+*.h5
+*.pt
+
+# Documentation
+docs/_build/
+*.pdf
+
+# Testing
+coverage/
+*.gcov
+*.gcda
+*.gcno
+
+# Package files
+*.tar.gz
+*.zip
+*.deb
+*.rpm
