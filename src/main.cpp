@@ -4,6 +4,8 @@
 #include "models/python_bridge.h"
 #include "data/market_data_feed.h"
 #include "risk/risk_manager.h"
+#include "utils/logger.h"
+#include "utils/config_validator.h"
 
 #include <iostream>
 #include <memory>
@@ -12,6 +14,7 @@
 #include <atomic>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <boost/program_options.hpp>
 
 using namespace hft;
 
@@ -58,7 +61,27 @@ Config load_config(const std::string& config_file) {
     }
     
     nlohmann::json json;
-    file >> json;
+    try {
+        file >> json;
+    } catch (const nlohmann::json::parse_error& e) {
+        throw std::runtime_error("Failed to parse config file: " + std::string(e.what()));
+    }
+    
+    // Validate configuration
+    auto validation = ConfigValidator::validateConfig(json);
+    if (!validation.is_valid) {
+        std::stringstream ss;
+        ss << "Configuration validation failed:\n";
+        for (const auto& error : validation.errors) {
+            ss << "  ERROR: " << error << "\n";
+        }
+        throw std::runtime_error(ss.str());
+    }
+    
+    // Log warnings
+    for (const auto& warning : validation.warnings) {
+        LOG_WARNING("Config warning: " + warning);
+    }
     
     // Parse FIX settings
     config.fix_config_file = json["fix"]["config_file"];
@@ -305,19 +328,65 @@ int main(int argc, char* argv[]) {
         signal(SIGTERM, signal_handler);
         
         // Parse command line arguments
-        if (argc < 2) {
-            std::cerr << "Usage: " << argv[0] << " <config_file>" << std::endl;
+        namespace po = boost::program_options;
+        po::options_description desc("HFT Market Maker Options");
+        desc.add_options()
+            ("help,h", "Show help message")
+            ("config,c", po::value<std::string>()->required(), "Configuration file path")
+            ("log-level,l", po::value<std::string>()->default_value("INFO"), "Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)")
+            ("log-file", po::value<std::string>()->default_value("market_maker.log"), "Log file path")
+            ("dry-run", po::bool_switch()->default_value(false), "Run in simulation mode without sending real orders")
+            ("validate-only", po::bool_switch()->default_value(false), "Validate configuration and exit");
+        
+        po::variables_map vm;
+        try {
+            po::store(po::parse_command_line(argc, argv, desc), vm);
+            
+            if (vm.count("help")) {
+                std::cout << desc << std::endl;
+                return 0;
+            }
+            
+            po::notify(vm);
+        } catch (const po::error& e) {
+            std::cerr << "Error: " << e.what() << "\n\n";
+            std::cerr << desc << std::endl;
             return 1;
         }
         
-        std::string config_file = argv[1];
+        std::string config_file = vm["config"].as<std::string>();
+        std::string log_level_str = vm["log-level"].as<std::string>();
+        std::string log_file = vm["log-file"].as<std::string>();
+        bool dry_run = vm["dry-run"].as<bool>();
+        bool validate_only = vm["validate-only"].as<bool>();
+        
+        // Initialize logger
+        LogLevel log_level = LogLevel::INFO;
+        if (log_level_str == "DEBUG") log_level = LogLevel::DEBUG;
+        else if (log_level_str == "INFO") log_level = LogLevel::INFO;
+        else if (log_level_str == "WARNING") log_level = LogLevel::WARNING;
+        else if (log_level_str == "ERROR") log_level = LogLevel::ERROR;
+        else if (log_level_str == "CRITICAL") log_level = LogLevel::CRITICAL;
+        
+        Logger::initialize(log_level, log_file);
+        LOG_INFO("Starting HFT Market Maker v" + std::string(PROJECT_VERSION));
         
         // Load configuration
-        std::cout << "Loading configuration from " << config_file << "..." << std::endl;
+        LOG_INFO("Loading configuration from " + config_file);
         Config config = load_config(config_file);
         
+        if (validate_only) {
+            LOG_INFO("Configuration validation successful");
+            return 0;
+        }
+        
+        if (dry_run) {
+            LOG_WARNING("Running in DRY RUN mode - no real orders will be sent");
+        }
+        
         // Initialize risk system
-        std::cout << "Initializing risk management system..." << std::endl;
+        LOG_INFO("Initializing risk management system...");
+        PERF_LOG("risk_system_init");
         
         CapitalAllocator::AllocationConstraints capital_constraints{
             1000000.0,  // $1M total capital
@@ -365,13 +434,15 @@ int main(int argc, char* argv[]) {
         );
         
         // Initialize FIX handler
-        std::cout << "Initializing FIX protocol handler..." << std::endl;
+        LOG_INFO("Initializing FIX protocol handler...");
+        PERF_LOG("fix_handler_init");
         auto fix_handler = std::make_shared<FIXMarketDataHandler>(
             market_handler, order_handler
         );
         
         // Initialize strategies
-        std::cout << "Initializing trading strategies..." << std::endl;
+        LOG_INFO("Initializing trading strategies for " + std::to_string(config.symbols.size()) + " symbols");
+        PERF_LOG("strategies_init");
         std::unordered_map<std::string, std::shared_ptr<MarketMakingStrategy>> strategies;
         
         RiskParams risk_params{
@@ -406,20 +477,24 @@ int main(int argc, char* argv[]) {
         );
         
         // Initialize market data feed
-        std::cout << "Initializing market data feed..." << std::endl;
+        LOG_INFO("Initializing market data feed: " + config.market_data_feed);
+        PERF_LOG("market_data_init");
         std::shared_ptr<MarketDataFeed> data_feed;
         
         if (config.market_data_feed == "polygon") {
             data_feed = std::make_shared<PolygonWebSocketFeed>(config.polygon_api_key);
             data_feed->connect("wss://socket.polygon.io/stocks");
         } else if (config.market_data_feed == "simulated") {
+            LOG_WARNING("Using simulated market data feed");
             data_feed = std::make_shared<SimulatedMarketDataFeed>("./historical_data");
         }
         
         data_feed->addListener(market_handler);
         
         // Subscribe to symbols
-        std::cout << "Subscribing to market data..." << std::endl;
+        LOG_INFO("Subscribing to market data for symbols: " + 
+                 std::accumulate(config.symbols.begin(), config.symbols.end(), std::string(),
+                 [](const std::string& a, const std::string& b) { return a.empty() ? b : a + ", " + b; }));
         for (const auto& symbol : config.symbols) {
             data_feed->subscribe(symbol, 10);  // 10 levels deep
             fix_handler->subscribeMarketData(symbol, 10);
@@ -430,7 +505,7 @@ int main(int argc, char* argv[]) {
             while (g_running) {
                 // Periodic risk checks
                 if (!risk_system->getRiskManager()->isWithinRiskLimits()) {
-                    std::cerr << "Risk limits breached!" << std::endl;
+                    LOG_ERROR("Risk limits breached! Emergency stop may be triggered.");
                 }
                 
                 // Print metrics every 10 seconds
@@ -441,12 +516,13 @@ int main(int argc, char* argv[]) {
                     now - last_print).count() >= 10) {
                     
                     auto metrics = risk_system->getRiskManager()->getMetrics();
-                    std::cout << "\n=== Risk Metrics ===" << std::endl;
-                    std::cout << "Total Exposure: $" << metrics.total_exposure << std::endl;
-                    std::cout << "Daily P&L: $" << metrics.daily_pnl << std::endl;
-                    std::cout << "Current Drawdown: " << metrics.current_drawdown * 100 << "%" << std::endl;
-                    std::cout << "Leverage: " << metrics.leverage << "x" << std::endl;
-                    std::cout << "==================\n" << std::endl;
+                    std::stringstream ss;
+                    ss << "Risk Metrics - "
+                       << "Exposure: $" << std::fixed << std::setprecision(2) << metrics.total_exposure
+                       << ", Daily P&L: $" << metrics.daily_pnl
+                       << ", Drawdown: " << std::setprecision(1) << metrics.current_drawdown * 100 << "%"
+                       << ", Leverage: " << std::setprecision(2) << metrics.leverage << "x";
+                    LOG_INFO(ss.str());
                     
                     last_print = now;
                 }
@@ -456,7 +532,11 @@ int main(int argc, char* argv[]) {
         });
         
         // Main loop
-        std::cout << "\nMarket maker is running. Press Ctrl+C to stop.\n" << std::endl;
+        LOG_INFO("Market maker is running. Press Ctrl+C to stop.");
+        
+        // Log system information
+        LOG_INFO("System ready - Monitoring " + std::to_string(config.symbols.size()) + 
+                 " symbols with " + std::to_string(strategies.size()) + " strategies");
         
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -475,7 +555,7 @@ int main(int argc, char* argv[]) {
         }
         
         // Cleanup
-        std::cout << "\nShutting down..." << std::endl;
+        LOG_INFO("Shutdown signal received, cleaning up...");
         
         // Stop market data
         data_feed->disconnect();
@@ -490,15 +570,20 @@ int main(int argc, char* argv[]) {
         
         // Print final metrics
         auto final_metrics = risk_system->getRiskManager()->getMetrics();
-        std::cout << "\n=== Final Metrics ===" << std::endl;
-        std::cout << "Total P&L: $" << (final_metrics.daily_pnl) << std::endl;
-        std::cout << "Max Drawdown: " << final_metrics.max_drawdown * 100 << "%" << std::endl;
-        std::cout << "Total Trades: " << fix_handler->getMessageCount() << std::endl;
-        std::cout << "=====================\n" << std::endl;
+        LOG_INFO("=== Final Session Metrics ===");
+        LOG_INFO("Total P&L: $" + std::to_string(final_metrics.daily_pnl));
+        LOG_INFO("Max Drawdown: " + std::to_string(final_metrics.max_drawdown * 100) + "%");
+        LOG_INFO("Total Messages: " + std::to_string(fix_handler->getMessageCount()));
+        LOG_INFO("Session ended successfully");
         
     } catch (const std::exception& e) {
+        LOG_CRITICAL("Fatal error: " + std::string(e.what()));
         std::cerr << "Fatal error: " << e.what() << std::endl;
         return 1;
+    } catch (...) {
+        LOG_CRITICAL("Unknown fatal error occurred");
+        std::cerr << "Unknown fatal error occurred" << std::endl;
+        return 2;
     }
     
     return 0;
