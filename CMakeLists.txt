@@ -55,6 +55,17 @@ include_directories(
     ${Python3_INCLUDE_DIRS}
 )
 
+# Utils library
+add_library(hft_utils STATIC
+    src/utils/logger.cpp
+    src/utils/config_validator.cpp
+)
+
+target_link_libraries(hft_utils
+    ${CMAKE_THREAD_LIBS_INIT}
+    nlohmann_json::nlohmann_json
+)
+
 # Core library
 add_library(hft_core STATIC
     src/core/order_book.cpp
@@ -65,6 +76,7 @@ target_link_libraries(hft_core
     ${CMAKE_THREAD_LIBS_INIT}
     ${Boost_LIBRARIES}
     ${QUICKFIX_LIBRARY}
+    hft_utils
 )
 
 # Strategies library
@@ -125,7 +137,9 @@ target_link_libraries(market_maker
     hft_models
     hft_data
     hft_risk
+    hft_utils
     ${CMAKE_THREAD_LIBS_INIT}
+    nlohmann_json::nlohmann_json
 )
 
 # Backtesting executable
@@ -139,6 +153,9 @@ target_link_libraries(backtest
     hft_models
     hft_data
     hft_risk
+    hft_utils
+    ${CMAKE_THREAD_LIBS_INIT}
+    nlohmann_json::nlohmann_json
 )
 
 # Tests
@@ -178,6 +195,18 @@ target_link_libraries(test_risk
 )
 
 add_test(NAME test_risk COMMAND test_risk)
+
+# Config validator tests
+add_executable(test_config_validator
+    tests/test_config_validator.cpp
+)
+
+target_link_libraries(test_config_validator
+    hft_utils
+    nlohmann_json::nlohmann_json
+)
+
+add_test(NAME test_config_validator COMMAND test_config_validator)
 
 # Performance benchmarks
 add_executable(benchmark_order_book
